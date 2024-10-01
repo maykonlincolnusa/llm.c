@@ -3,7 +3,7 @@ Reference code for LLaMA-3.1 training and inference.
 Will save the model weights into files, to be read from C as initialization.
 
 This code differs from GPT-2 very slightly, there are three main differences:
-1) RoPE: LLaMA uses a different positional encoding scheme called Relative Positional Encoding (RoPE).
+1) RoPE: LLaMA uses a different positional encoding scheme called Rotary Position Embedding (RoPE).
 2) GQA: Grouped Query Attention (GQA) is used to reduce the number of attention heads.
 3) SwiGLU: Swish-Gated Linear Unit (SwiGLU) is used as the activation function in the MLP.
 
@@ -170,9 +170,7 @@ class CausalSelfAttention(nn.Module):
         qkv = self.c_attn(x)
         q, k, v = qkv.split([self.n_head * self.hd, self.n_kv_head * self.hd, self.n_kv_head * self.hd], dim=-1)
         q, k, v = map(lambda t: t.view(B, T, -1, self.hd), (q, k, v))  # (B, T, NH, HD)
-
         q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)  # rotate QK (rope)  <-- 1. difference compared to GPT-2
-
         if self.use_kv and not self.training and start_pos >= 0:  # use kv-caching during inference
             self.cache_k[:B, start_pos : start_pos + T] = k
             self.cache_v[:B, start_pos : start_pos + T] = v
@@ -299,8 +297,12 @@ class LLaMA(nn.Module):
         # forward the LLaMA model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         freqs_cis = self.freqs_cis[start_pos:start_pos+t]
-
         mask = torch.triu(torch.ones((t, t), device=next(self.parameters()).device, dtype=torch.bool), diagonal=1)
+
+        DEBUG_POINT = x.detach()
+        DEBUG_POINT = DEBUG_POINT.requires_grad_(True)
+        self.DEBUG_POINT = DEBUG_POINT
+        x = DEBUG_POINT
 
         for i, block in enumerate(self.transformer.h):
             x = block(x, freqs_cis, start_pos, mask)
@@ -847,25 +849,61 @@ def write_bf16(tensor, file):
 
 def write_tensors(model_tensors, L, file, dtype):
     # writes LLaMA 3 model's weights to a binary file
+    # things get a bit more complicated though:
+    # 1) We want to maintain the ability to finetune just the biases in the C code
+    #    and also GPT-2 supported biases and we want to touch as little code as possible.
+    #    => We will generate biases of all zeros and write them here. It's very little data.
+    # 2) We want to exactly preserve the GPT-2 code paths, so we can't have SwiGLU using two
+    #    separate nn.Linear layers c_fc and c_fc2. We will merge them into a single c_fc layer.
+    #    Then later in the C code, we do pointer arithmetic to recover them fully internal to
+    #    the SwiGLU layer
+    # 3) Llama 3 does not use position embeddings table so we have to remove it. AT THE SAME TIME,
+    #    and, very conveniently, Llama 3 does not share the output projection weights with the
+    #    token embeddings table, so we have to add it. Well instead of removing and adding, we
+    #    are going to write the output projection weights into the slot previously used for the
+    #    position embeddings table. Everyone is happy, very little code is changed from GPT-2.
     assert dtype in {"float32", "bfloat16"}
     write_fun = write_fp32 if dtype == "float32" else write_bf16
     write_fun(model_tensors["transformer.wte.weight"], file) # (V, C)
+    write_fun(model_tensors["lm_head.weight"], file) # (V, C) # <--- hack (3) here!
     for i in range(L): # (L, C)
         write_fun(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
+    for i in range(L): # (L, C)
+        # see hack (1) above for these
+        # yes i know this is inefficient and dumb i'm just matching the train_gpt2.py code format
+        write_fun(torch.zeros_like(model_tensors[f"transformer.h.{i}.ln_1.weight"]), file)
     for i in range(L): # (L, 3C, C)
         write_fun(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
+    for i in range(L): # (L, 3C)
+        w = model_tensors[f"transformer.h.{i}.attn.c_attn.weight"]
+        write_fun(torch.zeros(w.size(0), dtype=w.dtype), file)
     for i in range(L): # (L, C, C)
         write_fun(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
     for i in range(L): # (L, C)
+        w = model_tensors[f"transformer.h.{i}.attn.c_proj.weight"]
+        write_fun(torch.zeros(w.size(0), dtype=w.dtype), file)
+    for i in range(L): # (L, C)
         write_fun(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
+    for i in range(L): # (L, C)
+        write_fun(torch.zeros_like(model_tensors[f"transformer.h.{i}.ln_2.weight"]), file)
+    # now for hack (2) here... inline model surgery to concat c_fc and c_fc2
+    # -------------------------------------------
     for i in range(L): # (L, 4C, C)
+        # simply write the two weights in sequence
         write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
-    for i in range(L): # (L, 4C, C)
         write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc2.weight"], file)
+    for i in range(L): # (L, 4C)
+        w1 = model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"]
+        w2 = model_tensors[f"transformer.h.{i}.mlp.c_fc2.weight"]
+        write_fun(torch.zeros(w1.size(0) + w2.size(0), dtype=w1.dtype), file)
+    # -------------------------------------------
     for i in range(L): # (L, C, 4C)
         write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
+    for i in range(L): # (L, C)
+        w = model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"]
+        write_fun(torch.zeros(w.size(0), dtype=w.dtype), file)
     write_fun(model_tensors["transformer.ln_f.weight"], file) # (C, )
-    write_fun(model_tensors["lm_head.weight"], file) # (V, C)
+    write_fun(torch.zeros_like(model_tensors["transformer.ln_f.weight"]), file) # (C, )
 
 def write_model(model, filename, dtype):
     # everything we need to instantiate the model
@@ -875,28 +913,31 @@ def write_model(model, filename, dtype):
         "float32": 3, # 3: all tensors are fp32
         "bfloat16": 5, # 5: all tensors are bf16
     }[dtype]
-    header = torch.zeros(256, dtype=torch.int32)
-    header[0] = 20240803 # magic
-    header[1] = version # checkpoint version
-    header[2] = model.config.block_size
-    header[3] = model.config.vocab_size
-    header[4] = model.config.n_layer
-    header[5] = model.config.n_head
-    header[6] = model.config.n_kv_head
-    header[7] = model.config.n_embd
-    header[8] = model.config.ffn_dim_multiplier
-    header[9] = model.config.multiple_of
-    header[10] = model.config.norm_eps
-    header[11] = model.config.rope_theta
-    header[12] = model.config.use_scaled_rope
-    header[13] = model.config.max_gen_batch_size
-    header[14] = int(model.config.version.split('.')[0]) # major version
-    header[15] = int(model.config.version.split('.')[1]) # minor version
+    # integer section of the header
+    header_int = torch.zeros(256, dtype=torch.int32)
+    header_int[0] = 20240803 # magic
+    header_int[1] = version # checkpoint version
+    header_int[2] = model.config.block_size
+    header_int[3] = model.config.vocab_size
+    header_int[4] = model.config.n_layer
+    header_int[5] = model.config.n_head
+    header_int[6] = model.config.n_kv_head
+    header_int[7] = model.config.n_embd
+    header_int[8] = model.config.multiple_of
+    header_int[9] = int(model.config.use_scaled_rope)
+    header_int[10] = int(model.config.version.split('.')[0]) # major version
+    header_int[11] = int(model.config.version.split('.')[1]) # minor version
+    # float section of the header
+    header_float = torch.zeros(256, dtype=torch.float32)
+    header_float[0] = model.config.ffn_dim_multiplier
+    header_float[1] = model.config.norm_eps
+    header_float[2] = model.config.rope_theta
     # 2) the parameters follow the header
     params = {name: param.cpu() for name, param in model.named_parameters()}
     # now write to file
     with open(filename, "wb") as file:
-        file.write(header.numpy().tobytes()) # header
+        file.write(header_int.numpy().tobytes()) # int header
+        file.write(header_float.numpy().tobytes()) # float header
         write_tensors(params, model.config.n_layer, file, dtype) # params
     print(f"wrote {filename}")
 
@@ -1057,6 +1098,10 @@ if __name__ == "__main__":
         assert args.tokenizer_path is not None and os.path.exists(args.tokenizer_path), f"llama3 tokenizer path {args.tokenizer_path} does not exist"
         model = LLaMA.from_pretrained_llama3_meta(args.ckpt_dir, args.tokenizer_path)
 
+    # convert the model to the desired precision
+    if args.dtype == "float32":
+        model = model.to(torch.float32)
+
     model.train()
     if args.compile:
         if hasattr(config, "coordinate_descent_tuning"):
@@ -1085,6 +1130,7 @@ if __name__ == "__main__":
         # save model params, in bfloat16
         model_to_size = {"meta-llama/Meta-Llama-3.1-8B": "8B"}
         model_size_str = model_to_size[args.model] # e.g. "8B"
+        write_model(model, os.path.join(args.output_dir, f"llama3.1_{model_size_str}.bin"), dtype="float32")
         write_model(model, os.path.join(args.output_dir, f"llama3.1_{model_size_str}_bf16.bin"), dtype="bfloat16")
         # save x, y, logits, loss, and parameter gradients, for debugging C
         # always store these in fp32 to have an accurate reference (?)
@@ -1212,6 +1258,18 @@ if __name__ == "__main__":
             # backward pass
             if not args.inference_only:
                 loss.backward()
+
+                # ---------------------------------------------------------------------
+                # DEBUGGING: print first 32 elements of x
+                x = model.DEBUG_POINT.grad
+                for i in range(32):
+                    print("q[{}]: {:.8f}".format(i, x.view(-1)[i].item()))
+                # write to .bin file
+                with open("ref.bin", "wb") as f:
+                    f.write(x.view(-1).cpu().detach().numpy().tobytes())
+                breakpoint()
+                # ---------------------------------------------------------------------
+
         if ddp:
             dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
         lossf = lossf.item()
